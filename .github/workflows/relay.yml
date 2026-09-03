@@ -1,0 +1,30 @@
+name: relay
+
+# Drives the pegproof collector from GitHub Actions runner IPs:
+#  - relays eth_getLogs traffic the Worker cannot fetch itself (the chain's public RPC
+#    rate-limits Cloudflare Workers' shared egress IPs almost permanently), then
+#  - POSTs /__tick so the rest of a normal tick (snapshots, detectors, alerts) runs.
+# All ingest logic stays server-side; this job is a dumb, replaceable trigger.
+#
+# NOTE: GitHub disables cron schedules after 60 days without repo activity —
+# any commit resets the clock.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - run: node ingest-relay.mjs --tick
+        env:
+          WORKER_URL: https://pegproof-collector.xplowdiaka.workers.dev
+          DEBUG_TRIGGER_TOKEN: ${{ secrets.PEGPROOF_TRIGGER_TOKEN }}
