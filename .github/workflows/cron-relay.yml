@@ -1,6 +1,6 @@
 name: relay
 
-# Drives the pegproof collector (v2) from GitHub Actions runner IPs:
+# Drives the pegproof collector (v3, redenumit pt scheduler) from GitHub Actions runner IPs:
 #  - relays eth_getLogs traffic the Worker cannot fetch itself (the chain's public RPC
 #    rate-limits Cloudflare Workers' shared egress IPs almost permanently), then
 #  - POSTs /__tick so the rest of a normal tick (snapshots, detectors, alerts) runs.
