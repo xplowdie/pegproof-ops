@@ -1,0 +1,12 @@
+name: heartbeat
+# Minimal schedule-only witness: if THIS fires and cron-relay does not, the problem is
+# our workflow; if neither fires, the account-level scheduler is suppressed (new account).
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: date -u
