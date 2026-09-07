@@ -123,7 +123,16 @@ async function rpcCall(method, params) {
     try {
       return await rpcCallOnce(method, params);
     } catch (e2) {
-      throw new Error(`${method} failed twice — abandoning run: ${e2.message}`);
+      // Marked as a SOFT failure: upstream chain-RPC throttling/unavailability is an expected
+      // environmental condition, not a relay defect — main() turns it into exit 0 (with the
+      // --tick still fired and a partial summary printed) so scheduled runners (GitHub Actions)
+      // don't paint the run red and email the operator for a condition the system already
+      // handles honestly (the worker's stall bookkeeping is the durable record; the next
+      // scheduled run simply retries). Worker-side failures stay HARD (exit 1) — those mean
+      // the relay itself couldn't do its job for a reason that needs eyes.
+      const err = new Error(`${method} failed twice — abandoning chunk loop: ${e2.message}`);
+      err.chainSoftFail = true;
+      throw err;
     }
   }
 }
@@ -168,10 +177,14 @@ async function fetchChunk(next) {
  * `/__ingest/next`, stop on `noCursor`/`upToDate`, otherwise fetch that chunk's logs and POST
  * them back, looping on a stale response rather than treating it as fatal.
  *
- * Only a thrown error (an abandoned chain RPC call, or any other unexpected failure) skips
- * straight past the `--tick` call and the summary print below, all the way to `main().catch()` —
- * a deliberate choice: `--tick` firing a real tick against a cursor this run failed to fully
- * advance would run detectors over a state this run itself couldn't validate as complete.
+ * Failure semantics (revised after a week of scheduled-runner operation): a chain-RPC
+ * abandonment (`chainSoftFail`, see `rpcCall`) stops the chunk loop but is NOT a run failure —
+ * the `--tick` still fires (a tick is self-contained: its detectors process only `ingest_dirty`
+ * markers for chunks that actually landed, so a partially-advanced cursor is a perfectly valid
+ * state to tick over — the worker does exactly that on its own cron ticks too), the partial
+ * summary still prints, and the process exits 0. Only worker-side failures (a non-200 from
+ * `/__ingest*` that isn't a stale-409, `/__tick` unreachable, auth) escape to `main().catch()`
+ * and exit 1 — those are the ones a red run/notification should exist for.
  */
 async function main() {
   let chunksSent = 0;
@@ -179,6 +192,24 @@ async function main() {
   let lastCursor = null;
   let finalMessage = null;
 
+  try {
+    await relayLoop();
+  } catch (e) {
+    if (!e.chainSoftFail) throw e;
+    finalMessage = `soft-fail (chain RPC): ${e.message} — next scheduled run retries`;
+  }
+
+  if (DO_TICK) {
+    const { status, body } = await callWorker('/__tick', { method: 'POST' });
+    process.stdout.write(`[ingest-relay] /__tick -> status ${status} ok=${body.ok} note="${body.note}"\n`);
+  }
+
+  if (finalMessage) process.stdout.write(`[ingest-relay] ${finalMessage}\n`);
+  process.stdout.write(
+    `[ingest-relay] summary: chunks sent=${chunksSent} events inserted=${totalInserted} final cursor=${lastCursor ?? 'n/a'}\n`
+  );
+
+  async function relayLoop() {
   for (let i = 0; i < MAX_CHUNKS; i++) {
     const { status, body: next } = await callWorker('/__ingest/next');
     if (status !== 200) {
@@ -218,16 +249,7 @@ async function main() {
     totalInserted += postResult.inserted;
     lastCursor = postResult.cursor;
   }
-
-  if (DO_TICK) {
-    const { status, body } = await callWorker('/__tick', { method: 'POST' });
-    process.stdout.write(`[ingest-relay] /__tick -> status ${status} ok=${body.ok} note="${body.note}"\n`);
   }
-
-  if (finalMessage) process.stdout.write(`[ingest-relay] ${finalMessage}\n`);
-  process.stdout.write(
-    `[ingest-relay] summary: chunks sent=${chunksSent} events inserted=${totalInserted} final cursor=${lastCursor ?? 'n/a'}\n`
-  );
 }
 
 main().catch((e) => {
