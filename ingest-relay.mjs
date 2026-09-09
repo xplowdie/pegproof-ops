@@ -21,9 +21,27 @@
 // --tick: once the main relay loop finishes NORMALLY (upToDate, noCursor, or MAX_CHUNKS
 // reached — never after an abandoned/failed run, see main()'s doc comment), also POST /__tick
 // with the same bearer token, so one invocation both catches the event cursor up AND runs the
-// rest of a normal tick (snapshots, detectors, alerts).
+// rest of a normal tick (snapshots, detectors, alerts) — GATED by the tick-lag guard (opsfix,
+// Val A1) below.
+//
+// TICK-LAG GUARD (opsfix, Val A1 — production incident): gaps.ts's assessStall escalates a
+// stall to a PERMANENT 'gap-declared' once the cursor falls STALL_GAP_CEILING_BLOCKS=1,500,000
+// blocks behind anchor (see gaps.ts's own doc comment). A sustained chain-RPC outage (>43h, per
+// this relay's own observed 429 patterns) combined with ticks that keep firing regardless would
+// walk the cursor's lag straight past that ceiling and declare the span permanently lost. This
+// guard reads the CURRENT anchor/cursor gap right after the relay loop finishes (a dedicated,
+// final `GET /__ingest/next` call — see evaluateTickLagGuard's own doc comment for why a fresh
+// read, not the loop's own earlier reads, is used) and, if the lag already exceeds
+// TICK_SKIP_LAG_CEILING_BLOCKS, skips the `--tick` POST entirely rather than risk being the run
+// that pushes it over gaps.ts's own (larger) ceiling. PARTIAL GUARD, BY DESIGN (documented, not
+// hidden): this only covers ticks fired THROUGH THIS RELAY. Cloudflare's own cron trigger fires
+// scheduled ticks on this Worker independently of anything this script decides — this guard
+// narrows the risk window, it does not close it.
 //
 // Node >=20, zero dependencies — only the platform's native fetch/process globals.
+
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
 const WORKER_URL = process.env.WORKER_URL;
 const TOKEN = process.env.DEBUG_TRIGGER_TOKEN;
@@ -32,13 +50,37 @@ const MAX_CHUNKS = process.env.MAX_CHUNKS ? Number(process.env.MAX_CHUNKS) : 50;
 const PACE_MS = process.env.PACE_MS ? Number(process.env.PACE_MS) : 250;
 const DO_TICK = process.argv.includes('--tick');
 
-if (!WORKER_URL || !TOKEN) {
-  process.stderr.write('[ingest-relay] WORKER_URL and DEBUG_TRIGGER_TOKEN are required env vars\n');
-  process.exit(1);
-}
+/**
+ * Deliberately SMALLER than gaps.ts's own STALL_GAP_CEILING_BLOCKS (1,500,000) — this guard is
+ * meant to trip BEFORE the worker's own permanent-gap ceiling is at risk, not at the exact same
+ * line. 1,000,000 blocks leaves real headroom (~500,000 blocks, comfortably more than one more
+ * relay run's worth of catch-up) between "this relay declines to tick" and "the worker itself
+ * would declare the span permanently lost".
+ */
+export const TICK_SKIP_LAG_CEILING_BLOCKS = 1_000_000n;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Pure decision, given the exact JSON body `GET /__ingest/next` returns (index.ts's
+ * `handleIngestNext`): should firing `--tick` right now be skipped to avoid risking gaps.ts's
+ * permanent gap-declaration ceiling? `noCursor` (ingest has never run — nothing to gate; cursor
+ * initialization is the tick's own bootstrap job) and `upToDate: true` (cursor already at/past
+ * anchor — zero lag by definition) both mean "nothing to gate here", regardless of lag — only
+ * the `upToDate: false` shape carries `anchor.number`/`fromBlock` (decimal strings, per
+ * `handleIngestNext`'s own wire format), from which `cursor = fromBlock - 1n` (mirrors this
+ * script's `fetchChunk`/`relayLoop` treatment of the same fields elsewhere in this file).
+ */
+export function evaluateTickLagGuard(nextResponseBody) {
+  if (nextResponseBody.noCursor || nextResponseBody.upToDate) {
+    return { skip: false, lag: 0n };
+  }
+  const anchorNumber = BigInt(nextResponseBody.anchor.number);
+  const cursor = BigInt(nextResponseBody.fromBlock) - 1n;
+  const lag = anchorNumber - cursor;
+  return { skip: lag > TICK_SKIP_LAG_CEILING_BLOCKS, lag };
 }
 
 function workerUrl(path) {
@@ -187,6 +229,11 @@ async function fetchChunk(next) {
  * and exit 1 — those are the ones a red run/notification should exist for.
  */
 async function main() {
+  if (!WORKER_URL || !TOKEN) {
+    process.stderr.write('[ingest-relay] WORKER_URL and DEBUG_TRIGGER_TOKEN are required env vars\n');
+    process.exit(1);
+  }
+
   let chunksSent = 0;
   let totalInserted = 0;
   let lastCursor = null;
@@ -200,8 +247,26 @@ async function main() {
   }
 
   if (DO_TICK) {
-    const { status, body } = await callWorker('/__tick', { method: 'POST' });
-    process.stdout.write(`[ingest-relay] /__tick -> status ${status} ok=${body.ok} note="${body.note}"\n`);
+    // Dedicated, fresh GET (opsfix, Val A1) — deliberately NOT reusing whichever GET the loop
+    // above last happened to make: that response may be a whole run's worth of chunks stale by
+    // now, and this call is to our OWN worker (never the rate-limited chain RPC_URL), so the
+    // extra round trip costs nothing worth optimizing away.
+    const { status: guardStatus, body: guardBody } = await callWorker('/__ingest/next');
+    if (guardStatus !== 200) {
+      throw new Error(`GET /__ingest/next (tick-lag guard) returned ${guardStatus}: ${JSON.stringify(guardBody)}`);
+    }
+    const guard = evaluateTickLagGuard(guardBody);
+    if (guard.skip) {
+      process.stdout.write(
+        `[ingest-relay] tick skipped: cursor lags anchor by ${guard.lag} blocks — avoiding gap declaration ` +
+          `(this relay's own ceiling is ${TICK_SKIP_LAG_CEILING_BLOCKS} blocks; see this file's TICK-LAG GUARD ` +
+          `doc comment). NOTE: this guard only covers ticks fired through this relay — Cloudflare's own cron ` +
+          `trigger still fires scheduled ticks on this Worker independently.\n`
+      );
+    } else {
+      const { status, body } = await callWorker('/__tick', { method: 'POST' });
+      process.stdout.write(`[ingest-relay] /__tick -> status ${status} ok=${body.ok} note="${body.note}"\n`);
+    }
   }
 
   if (finalMessage) process.stdout.write(`[ingest-relay] ${finalMessage}\n`);
@@ -252,7 +317,12 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  process.stderr.write(`[ingest-relay] ${e.message}\n`);
-  process.exit(1);
-});
+// Only run main() when executed directly (`node ingest-relay.mjs ...`) — not when imported for
+// its pure functions (evaluateTickLagGuard) by tests. Same guard, same reasoning, as
+// attribute-emission.mjs's identical pattern.
+if (path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1] ?? '')) {
+  main().catch((e) => {
+    process.stderr.write(`[ingest-relay] ${e.message}\n`);
+    process.exit(1);
+  });
+}
