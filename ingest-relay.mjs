@@ -34,9 +34,13 @@
 // read, not the loop's own earlier reads, is used) and, if the lag already exceeds
 // TICK_SKIP_LAG_CEILING_BLOCKS, skips the `--tick` POST entirely rather than risk being the run
 // that pushes it over gaps.ts's own (larger) ceiling. PARTIAL GUARD, BY DESIGN (documented, not
-// hidden): this only covers ticks fired THROUGH THIS RELAY. Cloudflare's own cron trigger fires
-// scheduled ticks on this Worker independently of anything this script decides — this guard
-// narrows the risk window, it does not close it.
+// hidden): this only covers ticks fired THROUGH THIS RELAY. TWO OTHER paths fire ticks on this
+// Worker entirely independently of anything this script decides, both unguarded by this check:
+// Cloudflare's own cron trigger, AND the separately-deployed `pinger` worker (its own cron,
+// unconditional POST /__tick, no lag awareness at all — see the SDD ledger's post-A review M2
+// finding for how it was rediscovered: a forgotten fixture from 2 Sep, still live, still ticking).
+// This guard narrows the risk window, it does not close it — a genuine fix (uniform,
+// server-side lag awareness across every tick trigger) is scheduled for Plan 3/C1, not here.
 //
 // Node >=20, zero dependencies — only the platform's native fetch/process globals.
 
@@ -48,6 +52,20 @@ const TOKEN = process.env.DEBUG_TRIGGER_TOKEN;
 const RPC_URL = process.env.RPC_URL || 'https://rpc.mainnet.chain.robinhood.com';
 const MAX_CHUNKS = process.env.MAX_CHUNKS ? Number(process.env.MAX_CHUNKS) : 50;
 const PACE_MS = process.env.PACE_MS ? Number(process.env.PACE_MS) : 250;
+
+/**
+ * U3 (Val C2, 2026-09-10 — WAF on GitHub Actions runners): RH RPC intermittently serves a
+ * Cloudflare challenge page (HTTP 403 "Just a moment...") to GH Actions runner IPs specifically —
+ * observed correlated with a missing/generic default User-Agent (python's `urllib` default UA was
+ * outright blocked; Node's own `fetch` default UA gets through today, but is one CF ruleset tweak
+ * away from the same fate). Cheap mitigation: an explicit, identifying UA is more stable against
+ * WAF heuristics than relying on whatever the runtime's default happens to be. This does NOT
+ * replace the existing safety net — a persistent 403 (WAF or otherwise) still falls through
+ * `rpcCallOnce`'s generic `!response.ok` branch into `rpcCall`'s ordinary retry-then-soft-fail
+ * path (see that function's own doc comment) exactly as before; this only reduces how OFTEN that
+ * path has to be exercised for THIS specific cause.
+ */
+const RELAY_USER_AGENT = 'pegproof-relay/1.0 (+github-actions)';
 const DO_TICK = process.argv.includes('--tick');
 
 /**
@@ -126,7 +144,7 @@ async function pace() {
 async function rpcCallOnce(method, params) {
   const response = await fetch(RPC_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'User-Agent': RELAY_USER_AGENT },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
   });
   const text = await response.text();
@@ -192,6 +210,14 @@ function toHex(decimalStr) {
  * ingest.ts's own `fetchChunk`'s identical optimization). Query results are concatenated
  * as-is — no client-side dedupe; the worker's `writeChunk` does that (see the module doc
  * comments for why: a log matched by two of the 2-4 queries is expected and handled server-side).
+ *
+ * C3 (registry growth discovery): `next.discoveryQuery`, when present, is run as ONE MORE
+ * `eth_getLogs` call — deliberately WITHOUT an `address` field at all (unlike every query in
+ * `next.queries`, which are always scoped to `next.addresses`) — the whole point being to match
+ * mint events from contracts this worker doesn't track yet. Its logs are concatenated into the
+ * SAME `logs` array and POSTed back like everything else; the worker's own `/__ingest` handler
+ * (index.ts's `recordDiscoveryCandidates`) is what tells an unknown-address log apart from a
+ * known-registry one — this client has no registry awareness of its own, by design.
  */
 async function fetchChunk(next) {
   const fromHex = toHex(next.fromBlock);
@@ -201,6 +227,12 @@ async function fetchChunk(next) {
   for (const topics of next.queries) {
     const result = await rpcCall('eth_getLogs', [
       { address: next.addresses, topics, fromBlock: fromHex, toBlock: toHexValue },
+    ]);
+    logs.push(...result);
+  }
+  if (next.discoveryQuery) {
+    const result = await rpcCall('eth_getLogs', [
+      { topics: next.discoveryQuery.topics, fromBlock: fromHex, toBlock: toHexValue },
     ]);
     logs.push(...result);
   }
@@ -261,7 +293,7 @@ async function main() {
         `[ingest-relay] tick skipped: cursor lags anchor by ${guard.lag} blocks — avoiding gap declaration ` +
           `(this relay's own ceiling is ${TICK_SKIP_LAG_CEILING_BLOCKS} blocks; see this file's TICK-LAG GUARD ` +
           `doc comment). NOTE: this guard only covers ticks fired through this relay — Cloudflare's own cron ` +
-          `trigger still fires scheduled ticks on this Worker independently.\n`
+          `trigger and the separate pinger worker both still fire scheduled ticks on this Worker independently.\n`
       );
     } else {
       const { status, body } = await callWorker('/__tick', { method: 'POST' });
