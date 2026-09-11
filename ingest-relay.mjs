@@ -37,8 +37,7 @@
 // hidden): this only covers ticks fired THROUGH THIS RELAY. TWO OTHER paths fire ticks on this
 // Worker entirely independently of anything this script decides, both unguarded by this check:
 // Cloudflare's own cron trigger, AND the separately-deployed `pinger` worker (its own cron,
-// unconditional POST /__tick, no lag awareness at all — see the SDD ledger's post-A review M2
-// finding for how it was rediscovered: a forgotten fixture from 2 Sep, still live, still ticking).
+// unconditional POST /__tick, no lag awareness at all — a legacy witness worker fromearly Sep, still live).
 // This guard narrows the risk window, it does not close it — a genuine fix (uniform,
 // server-side lag awareness across every tick trigger) is scheduled for Plan 3/C1, not here.
 //
@@ -171,7 +170,7 @@ async function rpcCallOnce(method, params) {
  * failure abandons the WHOLE run (thrown up through `fetchChunk`/the main loop to `main()`'s
  * top-level `.catch()`, which prints the message and exits 1) — never a third attempt, and this
  * one policy covers every failure shape (a plain 429, a different HTTP error, a JSON-RPC error
- * body, a network blip) alike — any failure shape gets the same single-retry treatment.
+ * body, a network blip) alike, matching the brief's "la eroare/429" wording.
  */
 async function rpcCall(method, params) {
   await pace();
@@ -208,7 +207,7 @@ function toHex(decimalStr) {
  * resolves `toBlock`'s hash via `eth_getBlockByNumber` — skipping that call entirely when
  * `toBlock` IS the anchor, whose hash was already handed to us in `next.anchor.hash` (mirrors
  * ingest.ts's own `fetchChunk`'s identical optimization). Query results are concatenated
- * as-is — no client-side dedupe; the worker's `writeChunk` does that (see the module doc
+ * as-is — no client-side dedupe; the worker's `writeChunk` does that (see the brief/module doc
  * comments for why: a log matched by two of the 2-4 queries is expected and handled server-side).
  *
  * C3 (registry growth discovery): `next.discoveryQuery`, when present, is run as ONE MORE
@@ -257,8 +256,9 @@ async function fetchChunk(next) {
  * markers for chunks that actually landed, so a partially-advanced cursor is a perfectly valid
  * state to tick over — the worker does exactly that on its own cron ticks too), the partial
  * summary still prints, and the process exits 0. Only worker-side failures (a non-200 from
- * `/__ingest*` that isn't a stale-409, `/__tick` unreachable, auth) escape to `main().catch()`
- * and exit 1 — those are the ones a red run/notification should exist for.
+ * `/__ingest*` that isn't a stale-409, `/__tick` unreachable, a 5xx FROM `/__tick` itself — Val D,
+ * D6, external audit finding N7 — or auth) escape to `main().catch()` and exit 1 — those are the
+ * ones a red run/notification should exist for.
  */
 async function main() {
   if (!WORKER_URL || !TOKEN) {
@@ -297,6 +297,18 @@ async function main() {
       );
     } else {
       const { status, body } = await callWorker('/__tick', { method: 'POST' });
+      // Val D, D6 (external audit finding N7, MINOR): a 5xx here means the WORKER ITSELF errored
+      // (an uncaught exception/crash reaching Cloudflare's own error page — e.g. 1101/1102 — never
+      // something runTick's own exception-safety try/catch would produce, since that always
+      // returns a normal 200 body with `ok: false` and a truthful note for a HANDLED failure like
+      // an honest ingest stall). This is a worker defect, not the "environmental, self-healing"
+      // condition this relay's own chain-RPC soft-fail policy (rpcCall's own doc comment) exists
+      // for — we WANT a red run here, so a human notices. Thrown up to main()'s top-level catch,
+      // same as every other worker-side failure in this file (the GET /__ingest/next guard above
+      // already does exactly this for its own non-200 case).
+      if (status >= 500) {
+        throw new Error(`POST /__tick returned ${status} (worker-side failure, not an honest tick outcome): ${JSON.stringify(body)}`);
+      }
       process.stdout.write(`[ingest-relay] /__tick -> status ${status} ok=${body.ok} note="${body.note}"\n`);
     }
   }
