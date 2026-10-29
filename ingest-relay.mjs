@@ -76,29 +76,33 @@ function workerUrl(path) {
 }
 
 /**
- * One call against the worker's ops routes (`/__ingest/next`, `/__ingest`, `/__tick`). A fetch()
- * that throws is retried once after WORKER_RETRY_MS; a second throw fails the run. An answer from
- * the worker (any status, non-JSON) is never retried: the callers judge it.
+ * One call against the worker's ops routes (`/__ingest/next`, `/__ingest`, `/__tick`). A network
+ * failure (fetch() or reading the body throws) is retried once after WORKER_RETRY_MS; a second one
+ * fails the run. An answer from the worker (any status, non-JSON) is never retried: the callers
+ * judge it.
  * Replaying is safe on every route: `/__ingest/next` is a read, a replayed POST `/__ingest` gets
- * the cursor guard's 409 stale (relayLoop re-fetches), a replayed `/__tick` is one more tick.
+ * the cursor guard's 409 stale (relayLoop re-fetches), a replayed `/__tick` is one more tick, which
+ * the worker already handles when the Cloudflare cron and this relay overlap.
  */
 export async function callWorker(path, init = {}) {
-  const request = () =>
-    fetch(workerUrl(path), {
+  const attempt = async () => {
+    const response = await fetch(workerUrl(path), {
       ...init,
       headers: { Authorization: `Bearer ${TOKEN}`, ...(init.headers ?? {}) },
     });
-  let response;
+    return { response, text: await response.text() };
+  };
+  let result;
   try {
-    response = await request();
+    result = await attempt();
   } catch (e) {
     process.stderr.write(
       `[ingest-relay] worker ${path} unreachable (${e instanceof Error ? e.message : String(e)}), retrying in ${WORKER_RETRY_MS / 1000}s...\n`
     );
     await sleep(WORKER_RETRY_MS);
-    response = await request();
+    result = await attempt();
   }
-  const text = await response.text();
+  const { response, text } = result;
   let body;
   try {
     body = text ? JSON.parse(text) : {};
@@ -431,7 +435,7 @@ async function main() {
       // Cursor moved out from under us (a concurrent scheduled tick, most likely) — re-GET
       // rather than abandon. Still counts as one of this run's MAX_CHUNKS iterations, which
       // bounds even a pathological repeated-stale scenario.
-      process.stderr.write(`[ingest-relay] stale range (cursor now ${postResult.cursor}), re-fetching next range\n`);
+      process.stderr.write(`[ingest-relay] stale range (cursor now ${postResult.cursor}: a concurrent tick, or our own retried POST that had already landed), re-fetching next range\n`);
       continue;
     }
     if (postStatus !== 200) {
