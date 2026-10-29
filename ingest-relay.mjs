@@ -3,8 +3,8 @@
 // rate-limit (a residential connection, a GitHub Actions runner, etc.), fetching eth_getLogs
 // traffic on the pegproof-collector Worker's behalf while every bit of actual ingest logic
 // (addresses, treasury topics, chunk sizing, the cursor itself, dedupe, classification, the
-// atomic D1 write) stays entirely server-side. See the module doc comments below for the full
-// architecture rationale: RH RPC 429s Cloudflare Workers' shared egress IPs almost permanently,
+// atomic D1 write) stays entirely server-side. Architecture
+// rationale: RH RPC 429s Cloudflare Workers' shared egress IPs almost permanently,
 // while the identical RPC works fine from here.
 //
 // Usage:
@@ -22,7 +22,7 @@
 // --tick: once the main relay loop finishes NORMALLY (upToDate, noCursor, or MAX_CHUNKS
 // reached — never after an abandoned/failed run, see main()'s doc comment), also POST /__tick
 // with the same bearer token, so one invocation both catches the event cursor up AND runs the
-// rest of a normal tick (snapshots, detectors, alerts) — fired UNCONDITIONALLY (Plan 3a Task 8):
+// rest of a normal tick (snapshots, detectors, alerts) — fired UNCONDITIONALLY:
 // the worker's own `runTick` now carries the uniform ingest lag guard this relay used to apply
 // only to itself (its old TICK_SKIP_LAG_CEILING_BLOCKS/evaluateTickLagGuard, removed here — see
 // collector/src/index.ts's TICK_INGEST_LAG_CEILING_BLOCKS doc comment for the full replacement
@@ -39,7 +39,7 @@ import path from 'node:path';
 
 const WORKER_URL = process.env.WORKER_URL;
 const TOKEN = process.env.DEBUG_TRIGGER_TOKEN;
-// Exported (code-review finding 6 testability): WORKER_URL/RPC_URL/TOKEN are captured from
+// Exported for testability: WORKER_URL/RPC_URL/TOKEN are captured from
 // process.env at module-load time — a test that needs a specific WORKER_URL/RPC_URL must set the
 // env var(s) BEFORE this module is first imported (a dynamic `await import(...)` after setting
 // `process.env.*`, in its own test file so vitest's per-file module isolation gives it a fresh
@@ -51,7 +51,7 @@ const MAX_CHUNKS = process.env.MAX_CHUNKS ? Number(process.env.MAX_CHUNKS) : 50;
 const PACE_MS = process.env.PACE_MS ? Number(process.env.PACE_MS) : 250;
 
 /**
- * (2026-09-10 — WAF on GitHub Actions runners): RH RPC intermittently serves a
+ * WAF on GitHub Actions runners: RH RPC intermittently serves a
  * Cloudflare challenge page (HTTP 403 "Just a moment...") to GH Actions runner IPs specifically —
  * observed correlated with a missing/generic default User-Agent (python's `urllib` default UA was
  * outright blocked; Node's own `fetch` default UA gets through today, but is one CF ruleset tweak
@@ -64,6 +64,8 @@ const PACE_MS = process.env.PACE_MS ? Number(process.env.PACE_MS) : 250;
  */
 const RELAY_USER_AGENT = 'pegproof-relay/1.0 (+github-actions)';
 const DO_TICK = process.argv.includes('--tick');
+/** Wait before the single retry of a worker call whose fetch() threw (see callWorker). */
+const WORKER_RETRY_MS = 5000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -74,17 +76,28 @@ function workerUrl(path) {
 }
 
 /**
- * One call against the worker's own guarded ops routes (`/__ingest/next`, `/__ingest`,
- * `/__tick`). Never retried here — a worker-side failure (network blip reaching the Worker
- * itself, a non-JSON body, etc.) propagates straight to `main()`'s top-level catch and abandons
- * the run; only the chain RPC calls in `rpcCall` below get the "one retry after 5s"
- * treatment, since those are the calls this whole relay exists to work around rate-limiting on.
+ * One call against the worker's ops routes (`/__ingest/next`, `/__ingest`, `/__tick`). A fetch()
+ * that throws is retried once after WORKER_RETRY_MS; a second throw fails the run. An answer from
+ * the worker (any status, non-JSON) is never retried: the callers judge it.
+ * Replaying is safe on every route: `/__ingest/next` is a read, a replayed POST `/__ingest` gets
+ * the cursor guard's 409 stale (relayLoop re-fetches), a replayed `/__tick` is one more tick.
  */
-async function callWorker(path, init = {}) {
-  const response = await fetch(workerUrl(path), {
-    ...init,
-    headers: { Authorization: `Bearer ${TOKEN}`, ...(init.headers ?? {}) },
-  });
+export async function callWorker(path, init = {}) {
+  const request = () =>
+    fetch(workerUrl(path), {
+      ...init,
+      headers: { Authorization: `Bearer ${TOKEN}`, ...(init.headers ?? {}) },
+    });
+  let response;
+  try {
+    response = await request();
+  } catch (e) {
+    process.stderr.write(
+      `[ingest-relay] worker ${path} unreachable (${e instanceof Error ? e.message : String(e)}), retrying in ${WORKER_RETRY_MS / 1000}s...\n`
+    );
+    await sleep(WORKER_RETRY_MS);
+    response = await request();
+  }
   const text = await response.text();
   let body;
   try {
@@ -104,10 +117,10 @@ async function pace() {
 }
 
 /**
- * Code-review finding 6: distinguishes a JSON-RPC error body that is a genuinely TRANSIENT
+ * Distinguishes a JSON-RPC error body that is a genuinely TRANSIENT
  * condition (some providers report rate-limiting/capacity issues this way instead of an HTTP 429)
  * from a DETERMINISTIC one — the default for everything else a JSON-RPC error body can mean
- * (a malformed request, an unsupported method, or — the case this finding exists for — a query
+ * (a malformed request, an unsupported method, or — the case this distinction exists for — a query
  * whose RANGE is simply too wide, e.g. "logs matched exceeds 10000"). A deterministic error
  * retried unchanged fails unchanged; only messages that look like a transient capacity/rate signal
  * get the transient classification.
@@ -117,7 +130,7 @@ export function isTransientRpcErrorMessage(message) {
 }
 
 /**
- * Code-review finding 6: identifies the ONE specific deterministic shape this file has a real
+ * Identifies the ONE specific deterministic shape this file has a real
  * remedy for — an `eth_getLogs` range with too many matching logs for the provider to return in a
  * single call (the exact production example: "logs matched exceeds 10000"). Distinct from
  * `isTransientRpcErrorMessage` — this is still a DETERMINISTIC failure (retrying the identical
@@ -134,11 +147,11 @@ export function isTooManyLogsMessage(message) {
 /**
  * A single raw JSON-RPC POST to RPC_URL. Throws on a network-level failure, a non-2xx HTTP
  * status, a JSON-RPC error body, or a non-JSON response — every thrown error carries a
- * `transient` boolean (code-review finding 6) so `rpcCall` below can apply the right policy
+ * `transient` boolean so `rpcCall` below can apply the right policy
  * instead of treating every failure alike:
  *   - network error (fetch() itself threw — DNS, connection reset, timeout): transient.
  *   - HTTP 429, 403 (RH RPC's own WAF intermittently challenges GH Actions runner IPs this way —
- *     see this file's own U3 doc comment; NOT the query's fault), or 5xx: transient.
+ *     see this file's own WAF doc comment; NOT the query's fault), or 5xx: transient.
  *   - any OTHER non-2xx status (400, 404, ...): deterministic — the request itself, not the
  *     server's load, is the problem.
  *   - non-JSON body despite a 2xx status: transient (an edge/proxy glitch is more likely than a
@@ -192,7 +205,7 @@ async function rpcCallOnce(method, params) {
 }
 
 /**
- * One paced chain RPC call. Code-review finding 6 (REPLACES the old "wait 5s, retry once, any
+ * One paced chain RPC call (REPLACES the old "wait 5s, retry once, any
  * second failure is soft" policy, which treated a DETERMINISTIC failure — e.g. an `eth_getLogs`
  * range with "too many logs matched" — exactly like a transient one: soft-failed, exit 0, green
  * CI, and the NEXT scheduled run retries the SAME range and hits the SAME deterministic error
@@ -243,7 +256,7 @@ function toHex(decimalStr) {
  * (see the module doc comments for why: a log matched by two of the 2-4 queries is expected
  * and handled server-side).
  *
- * C3 (registry growth discovery): `next.discoveryQuery`, when present, is run as ONE MORE
+ * Registry growth discovery: `next.discoveryQuery`, when present, is run as ONE MORE
  * `eth_getLogs` call — deliberately WITHOUT an `address` field at all (unlike every query in
  * `next.queries`, which are always scoped to `next.addresses`) — the whole point being to match
  * mint events from contracts this worker doesn't track yet. Its logs are concatenated into the
@@ -281,7 +294,7 @@ async function fetchChunkOnce(next) {
 }
 
 /**
- * HALVING RETRY (code-review finding 6): wraps `fetchChunkOnce` to catch a deterministic
+ * HALVING RETRY: wraps `fetchChunkOnce` to catch a deterministic
  * `eth_getLogs` "too many logs" error (`tooManyLogsError` — see `rpcCallOnce`'s own doc comment)
  * and retry EXACTLY ONCE against a NEW, HALVED chunk fetched from the server: `GET
  * /__ingest/next?max_blocks=N`, `N` = half this chunk's own block count. The SERVER, not this
@@ -340,8 +353,7 @@ export async function fetchChunk(next) {
  * markers for chunks that actually landed, so a partially-advanced cursor is a perfectly valid
  * state to tick over — the worker does exactly that on its own cron ticks too), the partial
  * summary still prints, and the process exits 0. Only worker-side failures (a non-200 from
- * `/__ingest*` that isn't a stale-409, `/__tick` unreachable, a 5xx FROM `/__tick` itself — hardening,
- * D6, external audit finding N7 — or auth) escape to `main().catch()` and exit 1 — those are the
+ * `/__ingest*` that isn't a stale-409, `/__tick` unreachable, a 5xx FROM `/__tick` itself, or auth) escape to `main().catch()` and exit 1 — those are the
  * ones a red run/notification should exist for.
  */
 async function main() {
@@ -363,12 +375,12 @@ async function main() {
   }
 
   if (DO_TICK) {
-    // Fired UNCONDITIONALLY (Plan 3a Task 8) — no lag guard here anymore; the worker's own
+    // Fired UNCONDITIONALLY — no lag guard here anymore; the worker's own
     // `runTick` now carries it (collector/src/index.ts's TICK_INGEST_LAG_CEILING_BLOCKS), applied
     // uniformly to every tick source, this relay included. See this file's own module doc comment
     // (the `--tick` paragraph) for the full rationale.
     const { status, body } = await callWorker('/__tick', { method: 'POST' });
-    // (hardening): a 5xx here means the WORKER ITSELF errored
+    // A 5xx here means the WORKER ITSELF errored
     // (an uncaught exception/crash reaching Cloudflare's own error page — e.g. 1101/1102 — never
     // something runTick's own exception-safety try/catch would produce, since that always
     // returns a normal 200 body with `ok: false` and a truthful note for a HANDLED failure like
@@ -404,7 +416,7 @@ async function main() {
       break;
     }
 
-    // `actualNext` may differ from `next` (code-review finding 6's halving retry fetched a
+    // `actualNext` may differ from `next` (the halving retry fetched a
     // smaller, DIFFERENT range from the server after a deterministic "too many logs" error) — the
     // POST below must declare the range that was ACTUALLY fetched, never the original request.
     const { logs, toBlockHash, next: actualNext } = await fetchChunk(next);
@@ -434,7 +446,7 @@ async function main() {
 }
 
 // Only run main() when executed directly (`node ingest-relay.mjs ...`) — not when imported for
-// its pure functions (isTransientRpcErrorMessage, isTooManyLogsMessage, rpcCall, fetchChunk) by
+// its pure functions (isTransientRpcErrorMessage, isTooManyLogsMessage, rpcCall, fetchChunk, callWorker) by
 // tests. Same guard, same reasoning, as attribute-emission.mjs's identical pattern.
 if (path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1] ?? '')) {
   main().catch((e) => {
