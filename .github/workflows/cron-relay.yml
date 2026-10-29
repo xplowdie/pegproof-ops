@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: node ingest-relay.mjs --tick
         env:
           WORKER_URL: https://pegproof-collector.xplowdiaka.workers.dev
